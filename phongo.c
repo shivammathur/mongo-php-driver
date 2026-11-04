@@ -22,9 +22,11 @@
 #endif
 
 #include <php.h>
+#include <SAPI.h>
 #include <ext/standard/info.h>
 
 #include "phongo.h"
+#include "src/phongo_atomic.h"
 #include "src/phongo_client.h"
 #include "src/phongo_error.h"
 #include "src/phongo_ini.h"
@@ -46,7 +48,8 @@ ZEND_TSRMLS_CACHE_DEFINE();
  * next engine startup reuses a libmongoc instance whose global state (e.g. the
  * handshake data) was freed by mongoc_cleanup() and cannot be restored by the
  * subsequent mongoc_init() call. */
-static bool phongo_libmongoc_initialized = false;
+static bool    phongo_libmongoc_initialized = false;
+static int32_t phongo_num_threads           = 0;
 
 /* Shut down libmongoc when the process exits. This is registered with atexit()
  * in MINIT and is intentionally not tied to the engine lifecycle. */
@@ -143,6 +146,7 @@ PHP_GINIT_FUNCTION(mongodb) /* {{{ */
 #endif
 
 	/* Clear extension globals */
+	phongo_atomic_int32_fetch_add(&phongo_num_threads, 1, phongo_memory_order_seq_cst);
 	memset(mongodb_globals, 0, sizeof(zend_mongodb_globals));
 
 	/* Initialize HashTable for persistent clients, which will be destroyed in
@@ -224,7 +228,9 @@ PHP_MINIT_FUNCTION(mongodb) /* {{{ */
 
 		/* libmongoc must be shut down at process exit. See the comment above
 		 * phongo_libmongoc_initialized for details. */
-		(void) atexit(phongo_libmongoc_shutdown);
+		if (strcmp(sapi_module.name, "cli") != 0 && strcmp(sapi_module.name, "cli-server") != 0) {
+			(void) atexit(phongo_libmongoc_shutdown);
+		}
 	}
 
 	/* Prep default object handlers to be used when we register the classes */
@@ -405,6 +411,10 @@ PHP_GSHUTDOWN_FUNCTION(mongodb) /* {{{ */
 	/* TODO: Check that logging actually gets disabled. The logger HashTable
 	 * should be empty by this point. */
 	phongo_log_set_stream(NULL);
+	if (phongo_atomic_int32_fetch_sub(&phongo_num_threads, 1, phongo_memory_order_seq_cst) == 1 &&
+		(strcmp(sapi_module.name, "cli") == 0 || strcmp(sapi_module.name, "cli-server") == 0) && phongo_libmongoc_initialized) {
+		phongo_libmongoc_shutdown();
+	}
 } /* }}} */
 
 PHP_MINFO_FUNCTION(mongodb) /* {{{ */
